@@ -21,8 +21,8 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    if message.channel.id != DISCORD_CHANNEL_ID:
-        return
+    #if message.channel.id != DISCORD_CHANNEL_ID:
+       # return
     if message.author.bot:
         return
 
