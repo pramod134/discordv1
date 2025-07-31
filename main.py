@@ -3,7 +3,7 @@ import discord
 from openai import OpenAI
 from telegram import Bot as TelegramBot
 
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))  # e.g., 117654321987654321
+#DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))  # e.g., 117654321987654321
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("CHAT_ID"))
