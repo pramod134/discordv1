@@ -1,60 +1,76 @@
 import os
+import sys
 import asyncio
 import json
 import time
+import traceback
 import discord
 from openai import OpenAI
 from telegram import Bot
 
+# ---------- Logging helpers ----------
+def log(*args):
+    print(*args, flush=True)
+
+def log_exc(prefix: str, e: Exception):
+    log(f"⚠️ {prefix}: {e}\n{traceback.format_exc()}")
+
+# ---------- Env ----------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+TELEGRAM_CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# --- Discord setup ---
+# Validate env presence (without printing secrets)
+missing = [name for name, val in [
+    ("DISCORD_TOKEN", DISCORD_TOKEN),
+    ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+    ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID_RAW),
+    ("OPENAI_API_KEY", OPENAI_API_KEY),
+] if not val]
+if missing:
+    log(f"❌ Missing required env vars: {', '.join(missing)}")
+    sys.exit(1)
+
+try:
+    TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID_RAW)
+except Exception:
+    # Allow channel IDs like -100123... (still int), but if this fails, bail early
+    log(f"❌ TELEGRAM_CHAT_ID must be an integer; got: {TELEGRAM_CHAT_ID_RAW}")
+    sys.exit(1)
+
+# ---------- Clients ----------
 intents = discord.Intents.default()
-intents.message_content = True  # listen to all text
 intents.messages = True
+intents.message_content = True  # requires toggle in Discord Portal
 
 client = discord.Client(intents=intents)
-
-# --- OpenAI & Telegram ---
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-# --------- PROMPTS ---------
+# ---------- Prompts ----------
 TEXT_SYSTEM_PROMPT = (
     "You are a trading assistant. Extract structured trade intel from text messages. "
-    "Focus on: ticker, entry price/zone, stop-loss (SL), take-profit (TP), exit conditions "
-    "(e.g., 'if candle closes below X'), directional bias (bullish/bearish/neutral), "
-    "key support/resistance levels or breakout/breakdown zones, and short rationale. "
-    "If specific values are missing, infer reasonable SL/TP based on context and say they are suggested.\n\n"
-    "Output ONLY valid JSON with keys: "
+    "Output ONLY JSON with keys: "
     "{'ticker': str|null, 'entry': str|null, 'stop_loss': str|null, 'take_profit': str|null, "
     "'exit_conditions': str|null, 'bias': str|null, 'levels': str|null, 'rationale': str|null, "
     "'confidence': number (0-1)}"
 )
 
 IMAGE_SYSTEM_PROMPT = (
-    "You are a trading assistant analyzing a trading chart image. Identify ticker if visible, "
-    "trend, key support/resistance, patterns (flags, wedges, H&S), levels/zones, and a likely setup. "
-    "If explicit Entry/SL/TP are annotated, extract them. If not, suggest reasonable values "
-    "based on the chart (mention they are suggested). Be specific (use numbers when visible).\n\n"
-    "Output ONLY valid JSON with keys: "
+    "You are a trading assistant analyzing a trading chart image. "
+    "Output ONLY JSON with keys: "
     "{'ticker': str|null, 'entry': str|null, 'stop_loss': str|null, 'take_profit': str|null, "
     "'exit_conditions': str|null, 'bias': str|null, 'levels': str|null, 'rationale': str|null, "
     "'confidence': number (0-1)}"
 )
 
-# --------- UTILITIES ---------
 def format_trade_summary(obj: dict) -> str:
-    """Turn our JSON into a clean Telegram message."""
-    def _g(k): 
+    def _g(k):
         v = obj.get(k)
         return v if (v is not None and str(v).strip() != "") else "—"
-
     lines = []
-    lines.append("📈 **Trade Idea Summary**")
+    lines.append("📈 Trade Idea Summary")
     lines.append(f"• Ticker: {_g('ticker')}")
     lines.append(f"• Bias: {_g('bias')}  |  Confidence: {round(float(obj.get('confidence', 0))*100)}%")
     lines.append(f"• Entry: {_g('entry')}")
@@ -67,17 +83,20 @@ def format_trade_summary(obj: dict) -> str:
     return "\n".join(lines)
 
 async def send_telegram(text: str):
-    # Telegram Bot API is async in v20+, so awaiting is correct.
-    # Split if >4096 chars
-    MAX_LEN = 4000
-    if len(text) <= MAX_LEN:
-        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=None)
-    else:
-        for i in range(0, len(text), MAX_LEN):
-            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text[i:i+MAX_LEN], parse_mode=None)
+    try:
+        # Telegram methods are coroutines in PTB v20+, can be awaited directly.
+        # Split long messages
+        MAX_LEN = 4000
+        if len(text) <= MAX_LEN:
+            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        else:
+            for i in range(0, len(text), MAX_LEN):
+                await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text[i:i+MAX_LEN])
+        log("✅ Sent message to Telegram.")
+    except Exception as e:
+        log_exc("Telegram send error", e)
 
 async def openai_json_completion(messages):
-    """Call OpenAI with JSON mode and basic exponential backoff."""
     delay = 1
     for attempt in range(5):
         try:
@@ -87,87 +106,103 @@ async def openai_json_completion(messages):
                 temperature=0.2,
                 messages=messages,
             )
-            raw = resp.choices[0].message.content
-            # Occasionally models wrap JSON in code fences—strip gracefully
-            raw = raw.strip().strip("`").strip()
+            raw = (resp.choices[0].message.content or "").strip().strip("`").strip()
             return json.loads(raw)
         except Exception as e:
             if attempt == 4:
                 raise
+            log(f"⏳ OpenAI retry {attempt+1}: {e}")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 8)
 
+# ---------- Discord events ----------
 @client.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user} (watching all channels)")
+    log(f"✅ Logged in as {client.user} (intents.message_content={intents.message_content})")
+
+    # Startup self-tests
+    try:
+        await send_telegram("🤖 Bot started on Railway. If you see this, Telegram path is OK.")
+    except Exception as e:
+        log_exc("Startup Telegram test failed", e)
+
+    # Heartbeat task
+    async def heartbeat():
+        while True:
+            log("💓 Heartbeat: bot alive")
+            await asyncio.sleep(30)
+    asyncio.create_task(heartbeat())
+
+@client.event
+async def on_error(event_method, *args, **kwargs):
+    # Catch unhandled exceptions in event handlers
+    log(f"❗ on_error in {event_method}")
+    log(traceback.format_exc())
 
 @client.event
 async def on_message(message: discord.Message):
-    # Ignore own msgs & other bots to avoid infinite loops / bot gossip
-    if message.author == client.user or message.author.bot:
-        return
+    try:
+        if message.author == client.user or (hasattr(message.author, "bot") and message.author.bot):
+            return
 
-    # Handle text
-    content = (message.content or "").strip()
-    # Collect attachments that are images
-    image_attachments = [
-        a for a in message.attachments
-        if (a.content_type and "image" in a.content_type.lower()) or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
-    ]
+        # Log every message hit (helps confirm Discord intent works)
+        log(f"👂 on_message: guild={getattr(message.guild, 'name', 'DM')} | "
+            f"channel={getattr(message.channel, 'name', 'DM')} | "
+            f"user={message.author} | has_content={bool(message.content)} | "
+            f"attachments={len(message.attachments)}")
 
-    # ---- TEXT SUMMARIZATION / EXTRACTION ----
-    if content:
-        try:
-            print(f"📨 Text received (#{message.channel}, {message.author}): {content[:80]}...")
-            messages = [
-                {"role": "system", "content": TEXT_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ]
-            obj = await openai_json_completion(messages)
-            human_summary = format_trade_summary(obj)
+        content = (message.content or "").strip()
+        image_attachments = [
+            a for a in message.attachments
+            if (a.content_type and "image" in a.content_type.lower()) or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+        ]
 
-            # Send to Telegram (summary + raw JSON for transparency if fields are sparse)
-            payload = human_summary
-            # If most fields are empty, include JSON too
-            emptyish = sum(1 for k in ["ticker","entry","stop_loss","take_profit","bias"] if not obj.get(k))
-            if emptyish >= 3:
-                payload = f"{human_summary}\n\n—\nJSON:\n{json.dumps(obj, indent=2)}"
+        # TEXT
+        if content:
+            try:
+                messages = [
+                    {"role": "system", "content": TEXT_SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ]
+                obj = await openai_json_completion(messages)
+                summary = format_trade_summary(obj)
+                # Attach JSON if sparse
+                emptyish = sum(1 for k in ["ticker","entry","stop_loss","take_profit","bias"] if not obj.get(k))
+                payload = summary if emptyish < 3 else f"{summary}\n\n—\nJSON:\n{json.dumps(obj, indent=2)}"
+                await send_telegram(payload)
+            except Exception as e:
+                log_exc("Text summarization error", e)
 
-            await send_telegram(payload)
-            print("✅ Text summary sent to Telegram.")
-        except Exception as e:
-            print(f"⚠️ Text summarization error: {e}")
+        # IMAGES
+        for a in image_attachments:
+            try:
+                log(f"🖼️ Image URL: {a.url}")
+                messages = [
+                    {"role": "system", "content": IMAGE_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": a.url, "detail": "high"}},
+                            {"type": "text", "text": content[:2000]} if content else {"type": "text", "text": ""}
+                        ]
+                    }
+                ]
+                obj = await openai_json_completion(messages)
+                summary = format_trade_summary(obj)
+                emptyish = sum(1 for k in ["ticker","entry","stop_loss","take_profit","bias"] if not obj.get(k))
+                payload = summary if emptyish < 3 else f"{summary}\n\n—\nJSON:\n{json.dumps(obj, indent=2)}"
+                await send_telegram(payload)
+            except Exception as e:
+                log_exc("Image processing error", e)
 
-    # ---- IMAGE SUMMARIZATION / EXTRACTION ----
-    for a in image_attachments:
-        try:
-            print(f"🖼️ Image found: {a.url}")
-            messages = [
-                {"role": "system", "content": IMAGE_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": a.url, "detail": "high"}
-                        },
-                        # Optional hint: pass the text too if present, helps disambiguate labels
-                        {"type": "text", "text": content[:2000]} if content else {"type": "text", "text": ""}
-                    ],
-                },
-            ]
-            obj = await openai_json_completion(messages)
-            human_summary = format_trade_summary(obj)
+    except Exception as e:
+        log_exc("on_message outer error", e)
 
-            payload = human_summary
-            emptyish = sum(1 for k in ["ticker","entry","stop_loss","take_profit","bias"] if not obj.get(k))
-            if emptyish >= 3:
-                payload = f"{human_summary}\n\n—\nJSON:\n{json.dumps(obj, indent=2)}"
-
-            await send_telegram(payload)
-            print("✅ Image summary sent to Telegram.")
-        except Exception as e:
-            print(f"⚠️ Image processing error: {e}")
-
-# Run the Discord client
-client.run(DISCORD_TOKEN)
+# ---------- Main ----------
+if __name__ == "__main__":
+    log("🚀 Starting bot...")
+    try:
+        client.run(DISCORD_TOKEN, log_handler=None)  # let our own prints handle logs
+    except Exception as e:
+        log_exc("Discord client.run failed", e)
+        sys.exit(1)
