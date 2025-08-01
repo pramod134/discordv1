@@ -2,8 +2,8 @@ import os
 import sys
 import asyncio
 import json
-import time
 import traceback
+from typing import Optional
 import discord
 from openai import OpenAI
 from telegram import Bot
@@ -21,7 +21,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Validate env presence (without printing secrets)
 missing = [name for name, val in [
     ("DISCORD_TOKEN", DISCORD_TOKEN),
     ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
@@ -41,7 +40,7 @@ except Exception:
 # ---------- Clients ----------
 intents = discord.Intents.default()
 intents.messages = True
-intents.message_content = True  # requires toggle in Discord Dev Portal
+intents.message_content = True  # also enable in Discord Dev Portal
 
 client = discord.Client(intents=intents)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -90,7 +89,7 @@ def format_trade_summary(obj: dict) -> str:
     return "\n".join(lines)
 
 async def send_telegram(text: str):
-    """v13 sync -> run in a thread to avoid blocking the event loop."""
+    """python-telegram-bot v13 sync -> run in a thread to avoid blocking."""
     try:
         MAX_LEN = 4000
         chunks = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)] or [text]
@@ -124,18 +123,67 @@ async def openai_json_completion(messages):
             await asyncio.sleep(delay)
             delay = min(delay * 2, 8)
 
+async def extract_text_from_message(message: discord.Message) -> str:
+    """
+    Extract useful text when .content is empty (forwards/embeds/replies).
+    Checks:
+      1) message.content
+      2) message.embeds (title, description, fields, footer)
+      3) referenced/original message (if it's a reply)
+    """
+    parts = []
+
+    if message.content and message.content.strip():
+        parts.append(message.content.strip())
+
+    for emb in message.embeds or []:
+        try:
+            if getattr(emb, "title", None):
+                parts.append(str(emb.title))
+            if getattr(emb, "description", None):
+                parts.append(str(emb.description))
+            for f in getattr(emb, "fields", []) or []:
+                name = f.name if f.name else ""
+                value = f.value if f.value else ""
+                field_text = f"{name}: {value}".strip(": ").strip()
+                if field_text:
+                    parts.append(field_text)
+            if getattr(emb, "footer", None) and getattr(emb.footer, "text", None):
+                parts.append(str(emb.footer.text))
+        except Exception:
+            pass
+
+    if message.reference and message.reference.message_id:
+        try:
+            ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            if ref_msg and ref_msg.content and ref_msg.content.strip():
+                parts.append(ref_msg.content.strip())
+            for emb in ref_msg.embeds or []:
+                if getattr(emb, "title", None):
+                    parts.append(str(emb.title))
+                if getattr(emb, "description", None):
+                    parts.append(str(emb.description))
+                for f in getattr(emb, "fields", []) or []:
+                    name = f.name if f.name else ""
+                    value = f.value if f.value else ""
+                    field_text = f"{name}: {value}".strip(": ").strip()
+                    if field_text:
+                        parts.append(field_text)
+        except Exception:
+            pass
+
+    text = "\n".join([p for p in parts if p]).strip()
+    return text
+
 # ---------- Discord events ----------
 @client.event
 async def on_ready():
     log(f"✅ Logged in as {client.user} (intents.message_content={intents.message_content})")
-
-    # Startup self-test (verifies Telegram path + chat ID)
     try:
         await send_telegram("🤖 Bot started on Railway. If you see this, Telegram path is OK.")
     except Exception as e:
         log_exc("Startup Telegram test failed", e)
 
-    # Heartbeat task to keep logs active
     async def heartbeat():
         while True:
             log("💓 Heartbeat: bot alive")
@@ -153,18 +201,27 @@ async def on_message(message: discord.Message):
         if message.author == client.user or (hasattr(message.author, "bot") and message.author.bot):
             return
 
-        # Visibility logs for every message the bot can read
         log(f"👂 on_message: guild={getattr(message.guild, 'name', 'DM')} | "
             f"channel={getattr(message.channel, 'name', 'DM')} | "
             f"user={message.author} | has_content={bool(message.content)} | "
-            f"attachments={len(message.attachments)}")
+            f"attachments={len(message.attachments)} | embeds={len(message.embeds)} | is_reply={bool(message.reference)}")
 
-        content = (message.content or "").strip()
+        # Extract text from content/embeds/replies
+        content = (await extract_text_from_message(message))[:6000]
+
         image_attachments = [
             a for a in message.attachments
             if (a.content_type and "image" in a.content_type.lower())
                or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
         ]
+
+        # Health checks
+        if (message.content or "").strip().lower() in ("/ping", "!ping"):
+            await message.channel.send("pong 🏓")
+            return
+        if (message.content or "").strip().lower() in ("/status", "!status"):
+            await message.channel.send("✅ Online. Telegram OK. Listening for text & image messages.")
+            return
 
         # ---- TEXT ----
         if content:
@@ -180,6 +237,8 @@ async def on_message(message: discord.Message):
                 await send_telegram(payload)
             except Exception as e:
                 log_exc("Text summarization error", e)
+        else:
+            log("ℹ️ No textual content extracted (content empty, no usable embeds/references).")
 
         # ---- IMAGES ----
         for a in image_attachments:
