@@ -3,7 +3,6 @@ import sys
 import asyncio
 import json
 import traceback
-from typing import Optional
 import discord
 from openai import OpenAI
 from telegram import Bot
@@ -125,26 +124,32 @@ async def openai_json_completion(messages):
 
 async def extract_text_from_message(message: discord.Message) -> str:
     """
-    Extract useful text when .content is empty (forwards/embeds/replies).
-    Checks:
+    Extract text from:
       1) message.content
-      2) message.embeds (title, description, fields, footer)
-      3) referenced/original message (if it's a reply)
+      2) message.embeds (title/description/fields/footer)
+      3) referenced/original message via:
+         - reference.cached_message
+         - reference.resolved
+         - same-channel fetch
+         - cross-channel fetch (if accessible)
+    Returns combined text; may be empty if the bot lacks permissions to view the original.
     """
     parts = []
 
+    # 1) Direct content
     if message.content and message.content.strip():
         parts.append(message.content.strip())
 
-    for emb in message.embeds or []:
+    # 2) Embeds on the message itself
+    for emb in getattr(message, "embeds", []) or []:
         try:
             if getattr(emb, "title", None):
                 parts.append(str(emb.title))
             if getattr(emb, "description", None):
                 parts.append(str(emb.description))
             for f in getattr(emb, "fields", []) or []:
-                name = f.name if f.name else ""
-                value = f.value if f.value else ""
+                name = f.name or ""
+                value = f.value or ""
                 field_text = f"{name}: {value}".strip(": ").strip()
                 if field_text:
                     parts.append(field_text)
@@ -153,27 +158,68 @@ async def extract_text_from_message(message: discord.Message) -> str:
         except Exception:
             pass
 
-    if message.reference and message.reference.message_id:
+    # 3) Reply/reference resolution
+    ref = getattr(message, "reference", None)
+    if ref:
+        # A) cached_message
         try:
-            ref_msg = await message.channel.fetch_message(message.reference.message_id)
-            if ref_msg and ref_msg.content and ref_msg.content.strip():
-                parts.append(ref_msg.content.strip())
-            for emb in ref_msg.embeds or []:
+            cached = getattr(ref, "cached_message", None)
+            if cached and cached.content and cached.content.strip():
+                parts.append(cached.content.strip())
+            for emb in getattr(cached, "embeds", []) or []:
                 if getattr(emb, "title", None):
                     parts.append(str(emb.title))
                 if getattr(emb, "description", None):
                     parts.append(str(emb.description))
-                for f in getattr(emb, "fields", []) or []:
-                    name = f.name if f.name else ""
-                    value = f.value if f.value else ""
-                    field_text = f"{name}: {value}".strip(": ").strip()
-                    if field_text:
-                        parts.append(field_text)
         except Exception:
             pass
 
-    text = "\n".join([p for p in parts if p]).strip()
-    return text
+        # B) resolved
+        try:
+            resolved = getattr(ref, "resolved", None)
+            if resolved and resolved.content and resolved.content.strip():
+                parts.append(resolved.content.strip())
+            for emb in getattr(resolved, "embeds", []) or []:
+                if getattr(emb, "title", None):
+                    parts.append(str(emb.title))
+                if getattr(emb, "description", None):
+                    parts.append(str(emb.description))
+        except Exception:
+            pass
+
+        # C) same-channel fetch
+        try:
+            if getattr(ref, "message_id", None) and hasattr(message.channel, "fetch_message"):
+                ref_msg = await message.channel.fetch_message(ref.message_id)
+                if ref_msg and ref_msg.content and ref_msg.content.strip():
+                    parts.append(ref_msg.content.strip())
+                for emb in getattr(ref_msg, "embeds", []) or []:
+                    if getattr(emb, "title", None):
+                        parts.append(str(emb.title))
+                    if getattr(emb, "description", None):
+                        parts.append(str(emb.description))
+        except Exception:
+            pass
+
+        # D) cross-channel fetch (if we have access)
+        try:
+            ch_id = getattr(ref, "channel_id", None)
+            msg_id = getattr(ref, "message_id", None)
+            if ch_id and msg_id:
+                ch = client.get_channel(ch_id) or await client.fetch_channel(ch_id)
+                if hasattr(ch, "fetch_message"):
+                    ref_msg2 = await ch.fetch_message(msg_id)
+                    if ref_msg2 and ref_msg2.content and ref_msg2.content.strip():
+                        parts.append(ref_msg2.content.strip())
+                    for emb in getattr(ref_msg2, "embeds", []) or []:
+                        if getattr(emb, "title", None):
+                            parts.append(str(emb.title))
+                        if getattr(emb, "description", None):
+                            parts.append(str(emb.description))
+        except Exception:
+            pass
+
+    return "\n".join([p for p in parts if p]).strip()
 
 # ---------- Discord events ----------
 @client.event
@@ -201,10 +247,24 @@ async def on_message(message: discord.Message):
         if message.author == client.user or (hasattr(message.author, "bot") and message.author.bot):
             return
 
-        log(f"👂 on_message: guild={getattr(message.guild, 'name', 'DM')} | "
+        log(
+            f"👂 on_message: guild={getattr(message.guild, 'name', 'DM')} | "
             f"channel={getattr(message.channel, 'name', 'DM')} | "
             f"user={message.author} | has_content={bool(message.content)} | "
-            f"attachments={len(message.attachments)} | embeds={len(message.embeds)} | is_reply={bool(message.reference)}")
+            f"attachments={len(message.attachments)} | embeds={len(message.embeds)} | "
+            f"is_reply={bool(message.reference)} | "
+            f"ref_channel_id={getattr(getattr(message, 'reference', None), 'channel_id', None)} | "
+            f"ref_message_id={getattr(getattr(message, 'reference', None), 'message_id', None)}"
+        )
+
+        # Health checks
+        raw = (message.content or "").strip().lower()
+        if raw in ("/ping", "!ping"):
+            await message.channel.send("pong 🏓")
+            return
+        if raw in ("/status", "!status"):
+            await message.channel.send("✅ Online. Telegram OK. Listening for text & image messages.")
+            return
 
         # Extract text from content/embeds/replies
         content = (await extract_text_from_message(message))[:6000]
@@ -214,14 +274,6 @@ async def on_message(message: discord.Message):
             if (a.content_type and "image" in a.content_type.lower())
                or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
         ]
-
-        # Health checks
-        if (message.content or "").strip().lower() in ("/ping", "!ping"):
-            await message.channel.send("pong 🏓")
-            return
-        if (message.content or "").strip().lower() in ("/status", "!status"):
-            await message.channel.send("✅ Online. Telegram OK. Listening for text & image messages.")
-            return
 
         # ---- TEXT ----
         if content:
