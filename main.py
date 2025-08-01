@@ -3,7 +3,6 @@ import discord
 import requests
 from openai import OpenAI
 from telegram import Bot
-from io import BytesIO
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -30,7 +29,7 @@ async def on_message(message):
     content = message.content.strip()
     files = message.attachments
 
-    # 🧠 Process text
+    # 🧠 Summarize text messages
     if content:
         try:
             print(f"📨 Text received: {content[:60]}")
@@ -47,19 +46,31 @@ async def on_message(message):
         except Exception as e:
             print(f"⚠️ Text summarization error: {e}")
 
-    # 🧠 Process image
+    # 🧠 Summarize image attachments
     for file in files:
         if file.content_type and "image" in file.content_type:
             try:
                 print(f"🖼️ Image found: {file.url}")
-                img_data = requests.get(file.url).content
                 response = openai_client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
-                        {"role": "system", "content": "Analyze this image. If it’s a trading chart, summarize the trade idea, chart patterns, and bias."},
-                        {"role": "user", "content": "Here's the chart image."}
-                    ],
-                    files={"image": BytesIO(img_data)}
+                        {
+                            "role": "system",
+                            "content": "You're a trading assistant. Summarize any trading chart image, explaining key levels, patterns, and potential setups."
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": file.url,
+                                        "detail": "high"
+                                    }
+                                }
+                            ]
+                        }
+                    ]
                 )
                 summary = response.choices[0].message.content
                 await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary)
