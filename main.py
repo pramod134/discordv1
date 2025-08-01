@@ -35,36 +35,43 @@ if missing:
 try:
     TELEGRAM_CHAT_ID = int(TELEGRAM_CHAT_ID_RAW)
 except Exception:
-    # Allow channel IDs like -100123... (still int), but if this fails, bail early
     log(f"❌ TELEGRAM_CHAT_ID must be an integer; got: {TELEGRAM_CHAT_ID_RAW}")
     sys.exit(1)
 
 # ---------- Clients ----------
 intents = discord.Intents.default()
 intents.messages = True
-intents.message_content = True  # requires toggle in Discord Portal
+intents.message_content = True  # requires toggle in Discord Dev Portal
 
 client = discord.Client(intents=intents)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)  # v13 sync API
 
 # ---------- Prompts ----------
 TEXT_SYSTEM_PROMPT = (
     "You are a trading assistant. Extract structured trade intel from text messages. "
-    "Output ONLY JSON with keys: "
+    "Focus on: ticker, entry price/zone, stop-loss (SL), take-profit (TP), exit conditions "
+    "(e.g., 'if candle closes below X'), directional bias (bullish/bearish/neutral), "
+    "key support/resistance levels or breakout/breakdown zones, and short rationale. "
+    "If specific values are missing, infer reasonable SL/TP based on context and say they are suggested.\n\n"
+    "Output ONLY valid JSON with keys: "
     "{'ticker': str|null, 'entry': str|null, 'stop_loss': str|null, 'take_profit': str|null, "
     "'exit_conditions': str|null, 'bias': str|null, 'levels': str|null, 'rationale': str|null, "
     "'confidence': number (0-1)}"
 )
 
 IMAGE_SYSTEM_PROMPT = (
-    "You are a trading assistant analyzing a trading chart image. "
-    "Output ONLY JSON with keys: "
+    "You are a trading assistant analyzing a trading chart image. Identify ticker if visible, "
+    "trend, key support/resistance, patterns (flags, wedges, H&S), levels/zones, and a likely setup. "
+    "If explicit Entry/SL/TP are annotated, extract them. If not, suggest reasonable values "
+    "based on the chart (mention they are suggested). Be specific (use numbers when visible).\n\n"
+    "Output ONLY valid JSON with keys: "
     "{'ticker': str|null, 'entry': str|null, 'stop_loss': str|null, 'take_profit': str|null, "
     "'exit_conditions': str|null, 'bias': str|null, 'levels': str|null, 'rationale': str|null, "
     "'confidence': number (0-1)}"
 )
 
+# ---------- Helpers ----------
 def format_trade_summary(obj: dict) -> str:
     def _g(k):
         v = obj.get(k)
@@ -83,20 +90,22 @@ def format_trade_summary(obj: dict) -> str:
     return "\n".join(lines)
 
 async def send_telegram(text: str):
+    """v13 sync -> run in a thread to avoid blocking the event loop."""
     try:
-        # Telegram methods are coroutines in PTB v20+, can be awaited directly.
-        # Split long messages
         MAX_LEN = 4000
-        if len(text) <= MAX_LEN:
-            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-        else:
-            for i in range(0, len(text), MAX_LEN):
-                await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text[i:i+MAX_LEN])
+        chunks = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)] or [text]
+        for chunk in chunks:
+            await asyncio.to_thread(
+                telegram_bot.send_message,
+                chat_id=TELEGRAM_CHAT_ID,
+                text=chunk
+            )
         log("✅ Sent message to Telegram.")
     except Exception as e:
         log_exc("Telegram send error", e)
 
 async def openai_json_completion(messages):
+    """Call OpenAI with JSON mode and basic exponential backoff."""
     delay = 1
     for attempt in range(5):
         try:
@@ -120,13 +129,13 @@ async def openai_json_completion(messages):
 async def on_ready():
     log(f"✅ Logged in as {client.user} (intents.message_content={intents.message_content})")
 
-    # Startup self-tests
+    # Startup self-test (verifies Telegram path + chat ID)
     try:
         await send_telegram("🤖 Bot started on Railway. If you see this, Telegram path is OK.")
     except Exception as e:
         log_exc("Startup Telegram test failed", e)
 
-    # Heartbeat task
+    # Heartbeat task to keep logs active
     async def heartbeat():
         while True:
             log("💓 Heartbeat: bot alive")
@@ -135,7 +144,6 @@ async def on_ready():
 
 @client.event
 async def on_error(event_method, *args, **kwargs):
-    # Catch unhandled exceptions in event handlers
     log(f"❗ on_error in {event_method}")
     log(traceback.format_exc())
 
@@ -145,7 +153,7 @@ async def on_message(message: discord.Message):
         if message.author == client.user or (hasattr(message.author, "bot") and message.author.bot):
             return
 
-        # Log every message hit (helps confirm Discord intent works)
+        # Visibility logs for every message the bot can read
         log(f"👂 on_message: guild={getattr(message.guild, 'name', 'DM')} | "
             f"channel={getattr(message.channel, 'name', 'DM')} | "
             f"user={message.author} | has_content={bool(message.content)} | "
@@ -154,10 +162,11 @@ async def on_message(message: discord.Message):
         content = (message.content or "").strip()
         image_attachments = [
             a for a in message.attachments
-            if (a.content_type and "image" in a.content_type.lower()) or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+            if (a.content_type and "image" in a.content_type.lower())
+               or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
         ]
 
-        # TEXT
+        # ---- TEXT ----
         if content:
             try:
                 messages = [
@@ -166,14 +175,13 @@ async def on_message(message: discord.Message):
                 ]
                 obj = await openai_json_completion(messages)
                 summary = format_trade_summary(obj)
-                # Attach JSON if sparse
                 emptyish = sum(1 for k in ["ticker","entry","stop_loss","take_profit","bias"] if not obj.get(k))
                 payload = summary if emptyish < 3 else f"{summary}\n\n—\nJSON:\n{json.dumps(obj, indent=2)}"
                 await send_telegram(payload)
             except Exception as e:
                 log_exc("Text summarization error", e)
 
-        # IMAGES
+        # ---- IMAGES ----
         for a in image_attachments:
             try:
                 log(f"🖼️ Image URL: {a.url}")
@@ -202,7 +210,7 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     log("🚀 Starting bot...")
     try:
-        client.run(DISCORD_TOKEN, log_handler=None)  # let our own prints handle logs
+        client.run(DISCORD_TOKEN, log_handler=None)  # use our own prints for logging
     except Exception as e:
         log_exc("Discord client.run failed", e)
         sys.exit(1)
